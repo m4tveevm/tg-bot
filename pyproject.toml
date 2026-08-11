@@ -34,4 +34,8 @@ testpaths = ["tests"]
 addopts = [
     "--strict-config",
     "--strict-markers",
+    "--cov=source.caldav_notification_state",
+    "--cov-branch",
+    "--cov-report=term-missing",
+    "--cov-fail-under=100",
 ]

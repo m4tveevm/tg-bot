@@ -1,54 +1,83 @@
-from typing import Optional, Set
+from sqlalchemy import delete, select
 
-from sqlalchemy import select, delete
-
+from source.caldav_notification_state import SentEventKey
 from source.db.db import get_session
 from source.migrations.models import CalDavSendData
 
 
-def get_events_from_db() -> Set[str]:
-    """Возвращает set строк в формате {tg_id}_{cooldown}_{event_name} из БД."""
+def get_sent_event_keys() -> set[SentEventKey]:
+    """Return the notification keys currently stored in the database."""
     with get_session() as session:
-        stmt = select(CalDavSendData.tg_id, CalDavSendData.cooldown, CalDavSendData.event_name)
-        result = session.execute(stmt).all()
-        return {f"{row.tg_id}_{row.cooldown}_{row.event_name}" for row in result}
+        stmt = select(
+            CalDavSendData.tg_id,
+            CalDavSendData.cooldown,
+            CalDavSendData.event_name,
+        )
+        rows = session.execute(stmt).all()
+        return {
+            SentEventKey(
+                telegram_id=row.tg_id,
+                cooldown_minutes=row.cooldown,
+                event_uid=row.event_name,
+            )
+            for row in rows
+        }
 
 
-def get_url_by_id(t_id: int) -> Optional[str]:
+def get_url_by_id(t_id: int) -> str | None:
     """Возвращает URL события по ID."""
     with get_session() as session:
         event = session.get(CalDavSendData, t_id)
         return event.url if event else None
 
 
-def get_name_by_id(t_id: int) -> Optional[str]:
+def get_name_by_id(t_id: int) -> str | None:
     """Возвращает event_name по ID."""
     with get_session() as session:
         event = session.get(CalDavSendData, t_id)
         return event.event_name if event else None
 
 
-def get_id_by_name(name: str) -> Optional[int]:
+def get_id_by_name(name: str) -> int | None:
     """Возвращает ID события по event_name."""
     with get_session() as session:
-        stmt = select(CalDavSendData).where(CalDavSendData.event_name == name)
+        stmt = select(CalDavSendData).where(
+            CalDavSendData.event_name == name,
+        )
         event = session.execute(stmt).scalar_one_or_none()
         return event.id if event else None
 
 
-def save_event_sends(name: str, tg_id: int, cooldown: int, event_name: str, url: str) -> None:
+def save_event_send(
+    name: str,
+    key: SentEventKey,
+    url: str,
+) -> None:
     """Сохраняет новое событие (игнорирует дубликаты)."""
     with get_session() as session:
-        # Проверяем существование
-        stmt = select(CalDavSendData).where(CalDavSendData.event_name == event_name, CalDavSendData.tg_id == tg_id, CalDavSendData.cooldown == cooldown)
+        stmt = select(CalDavSendData).where(
+            CalDavSendData.event_name == key.event_uid,
+            CalDavSendData.tg_id == key.telegram_id,
+            CalDavSendData.cooldown == key.cooldown_minutes,
+        )
         existing = session.execute(stmt).scalar_one_or_none()
         if not existing:
-            event = CalDavSendData(name=name, tg_id=tg_id, cooldown=cooldown, event_name=event_name, url=url)
+            event = CalDavSendData(
+                name=name,
+                tg_id=key.telegram_id,
+                cooldown=key.cooldown_minutes,
+                event_name=key.event_uid,
+                url=url,
+            )
             session.add(event)
 
 
-def delete_event_sends(name: str) -> None:
-    """Удаляет событие по event_name."""
+def delete_sent_event(key: SentEventKey) -> None:
+    """Delete one exact notification record."""
     with get_session() as session:
-        stmt = delete(CalDavSendData).where(CalDavSendData.event_name == name)
+        stmt = delete(CalDavSendData).where(
+            CalDavSendData.tg_id == key.telegram_id,
+            CalDavSendData.cooldown == key.cooldown_minutes,
+            CalDavSendData.event_name == key.event_uid,
+        )
         session.execute(stmt)

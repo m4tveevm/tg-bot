@@ -3,7 +3,12 @@ from source.config import WEB_CALDAV_URL, USERNAME, PASSWORD, COOLDOWN_TUESDAY, 
 from source.connections.sender import send_message_limited
 from source.db.repos.users import get_tg_id_by_email, save_email_by_username, get_timezone
 from source.app_logging import logger
-from source.db.repos.caldav_calendar import get_events_from_db, save_event_sends, delete_event_sends, get_id_by_name
+from source.caldav_notification_state import SentEventKey, find_stale_keys
+from source.db.repos.caldav_calendar import (
+    delete_sent_event,
+    get_sent_event_keys,
+    save_event_send,
+)
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 from caldav import DAVClient, error
@@ -608,9 +613,9 @@ def poll_events():
         start = datetime.now(TEAM_TZ)
 
         end = start + timedelta(days=1)
-        all_sended_events_uids = get_events_from_db()
-        current_found_uids = set()
-        caldav_error_occurred = False
+        saved_event_keys = get_sent_event_keys()
+        observed_event_keys: set[SentEventKey] = set()
+        scan_complete = True
 
         try:
             calendars = principal.calendars()
@@ -624,7 +629,7 @@ def poll_events():
                 events = calendar.date_search(start=start, end=end)
             except Exception as e:
                 logger.error(f"CALDAV: Ошибка поиска событий в календаре: {e}")
-                caldav_error_occurred = True
+                scan_complete = False
                 continue
 
             for event in events:
@@ -667,33 +672,45 @@ def poll_events():
 
                             attendees = get_all_participants(component)
                             name_for_send = ""
-                            teg_id_and_uid = event_uid
-                            list_not_send_tg_id = []
-                            now_cooldown_send = cooldowns[0]
+                            pending_event_keys: dict[int, SentEventKey] = {}
                             if attendees:
                                 for user in attendees:
                                     email = user.get('email')
                                     if email is None:
                                         continue
                                     tg_id_found = get_tg_id_by_email(email)
-                                    for i in cooldowns:
-                                        teg_id_and_uid = f"{tg_id_found}_{i}_{event_uid}"
-                                        current_found_uids.add(teg_id_and_uid)
-                                        if teg_id_and_uid not in all_sended_events_uids:
-                                            now_cooldown_send = i
-                                            break
-
-                                    if teg_id_and_uid in all_sended_events_uids:
-                                        list_not_send_tg_id.append(tg_id_found)
+                                    if tg_id_found is None:
                                         continue
-
-                                    all_sended_events_uids.add(teg_id_and_uid)
+                                    user_event_keys = [
+                                        SentEventKey(
+                                            telegram_id=tg_id_found,
+                                            cooldown_minutes=cooldown,
+                                            event_uid=event_uid,
+                                        )
+                                        for cooldown in cooldowns
+                                    ]
+                                    observed_event_keys.update(
+                                        user_event_keys
+                                    )
+                                    pending_event_key = next(
+                                        (
+                                            key
+                                            for key in user_event_keys
+                                            if key not in saved_event_keys
+                                        ),
+                                        None,
+                                    )
+                                    if pending_event_key is not None:
+                                        pending_event_keys[
+                                            tg_id_found
+                                        ] = pending_event_key
 
                                 for user in attendees:
                                     email = user.get('email')
                                     if email is None:
                                         continue
                                     teg_id = get_tg_id_by_email(email)
+                                    event_key = pending_event_keys.get(teg_id)
 
                                     tz_user = get_timezone(teg_id)
 
@@ -752,7 +769,7 @@ def poll_events():
                                     if res[-1] == '\n': res = res[:-1]
                                     res += '///'
 
-                                    if teg_id and teg_id not in list_not_send_tg_id:
+                                    if teg_id and event_key is not None:
                                         markup = InlineKeyboardMarkup()
                                         if short_url is not None:
                                             accept = "success" if user['status'] == "ACCEPTED" else None
@@ -772,19 +789,30 @@ def poll_events():
                                             else:
                                                 markup.row(btn_update)
                                         send_message_limited(teg_id, res, reply_markup=markup)
-                                        save_event_sends(name_for_send, teg_id, now_cooldown_send, event_uid, event_url)
+                                        save_event_send(
+                                            name_for_send,
+                                            event_key,
+                                            event_url,
+                                        )
+                                        saved_event_keys.add(event_key)
 
                 except Exception as e:
+                    scan_complete = False
                     logger.exception(f"CALDAV: ой {e}")
 
-        if not caldav_error_occurred:
-            deleted_events_uids = all_sended_events_uids - current_found_uids
-            for del_uid in deleted_events_uids:
-                try:
-                    uid_for_delete = del_uid.split('_')[-1]
-                    set_all_attendees_needs_action(uid_for_delete)
-                    delete_event_sends(uid_for_delete)
-                except Exception as e:
-                    logger.error(f"CALDAV: Ошибка удаления события из БД: {e}")
+        stale_keys = find_stale_keys(
+            saved_event_keys,
+            observed_event_keys,
+            scan_complete=scan_complete,
+        )
+        for stale_key in stale_keys:
+            try:
+                set_all_attendees_needs_action(stale_key.event_uid)
+                delete_sent_event(stale_key)
+            except Exception as e:
+                logger.error(
+                    "CALDAV: Ошибка удаления "
+                    f"события из БД: {e}"
+                )
 
         sleep(POLL_INTERVAL)
