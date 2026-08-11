@@ -1,4 +1,9 @@
 .env
+.coverage
+.pytest_cache/
+.ruff_cache/
+.venv/
+__pycache__/
 bot.log
 logs/bot.log
 .idea
@@ -9,4 +14,5 @@ source/connections/__pycache__
 source/db/__pycache__/
 source/db/repos/__pycache__/
 source/migrations/__pycache__/
-alembic
+alembic/__pycache__/
+alembic/versions/__pycache__/
