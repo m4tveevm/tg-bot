@@ -2,11 +2,53 @@ import requests
 from requests.auth import HTTPBasicAuth
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 from source.connections.bot_factory import bot
-from source.db.repos.users import delete_login_token, get_token, save_login_to_db_with_token, get_email_by_tg_id
+from source.db.repos.users import (
+    NEXTCLOUD_FIELD_MISSING,
+    get_email_by_tg_id,
+    get_token,
+    save_login_profile,
+)
 from source.config import BASE_URL, USERNAME, PASSWORD, HEADERS, WEB_APP_URL
 from source.connections.sender import send_message_limited, edit_message_limited
 from source.nc_calendar import update_event_partstat, msg_design_from_button
 from source.db.repos.caldav_calendar import get_name_by_id
+
+
+def complete_login_flow_profile(
+    tg_id: int,
+    auth_data: dict,
+    *,
+    base_url: str = WEB_APP_URL,
+    request_get=requests.get,
+    save_profile=save_login_profile,
+) -> str:
+    """Fetch and atomically persist the authenticated self profile."""
+    login_name = auth_data["loginName"]
+    app_password = auth_data["appPassword"]
+    headers = {
+        "OCS-APIRequest": "true",
+        "Accept": "application/json",
+    }
+    response = request_get(
+        base_url + "/ocs/v2.php/cloud/user",
+        auth=(login_name, app_password),
+        headers=headers,
+    )
+    response.raise_for_status()
+
+    user_data = response.json()["ocs"]["data"]
+    profile_login = user_data["id"]
+    save_profile(
+        tg_id,
+        profile_login,
+        user_data.get("email"),
+        app_password,
+        timezone_value=user_data.get(
+            "timezone",
+            NEXTCLOUD_FIELD_MISSING,
+        ),
+    )
+    return profile_login
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("move:"))
 def handle_card_move(call):
@@ -66,29 +108,10 @@ def check_login(call):
             bot.answer_callback_query(call.id, "Вы еще не подтвердили вход в браузере!", show_alert=True)
         elif response.status_code == 200:
             auth_data = response.json()
-            nc_login = auth_data['loginName']
-            nc_token = auth_data['appPassword']
-            headers_get_info = {
-                'OCS-APIRequest': 'true',
-                'Accept': 'application/json'
-            }
-            delete_login_token(call.from_user.id)
-
-
-            user_url = WEB_APP_URL + "/ocs/v2.php/cloud/user"
-
-            user_response = requests.get(
-                user_url,
-                auth=(nc_login, nc_token),
-                headers=headers_get_info
+            nc_login = complete_login_flow_profile(
+                call.from_user.id,
+                auth_data,
             )
-
-            user_response.raise_for_status()
-
-            data = user_response.json()
-            email = data.get("ocs", {}).get("data", {}).get("email")
-            nc_login = data.get("ocs", {}).get("data", {}).get("id")
-            save_login_to_db_with_token(call.from_user.id, nc_login, email, nc_token)
             bot.edit_message_text(f"✅ Успешно! Аккаунт {nc_login} привязан.",
                                   call.message.chat.id,
                                   call.message.message_id)
