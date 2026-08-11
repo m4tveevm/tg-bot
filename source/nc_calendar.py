@@ -530,79 +530,6 @@ def update_event_partstat(event_uid: str, user_email: str, new_status: str) -> b
         return False
 
 
-def set_all_attendees_needs_action(event_uid: str) -> bool:
-    """
-    Устанавливает статус NEEDS-ACTION (Ожидает решения)
-    для всех участников (ATTENDEE) указанного события.
-
-    event_uid: UID события
-    """
-    try:
-        start = datetime.now(TEAM_TZ)
-        end = start + timedelta(days=7)
-
-        client = DAVClient(WEB_CALDAV_URL, username=CALDAV_USERNAME, password=CALDAV_PASSWORD)
-        principal = client.principal()
-
-        target_event = None
-
-        calendars = principal.calendars()
-        for calendar in calendars:
-            try:
-                events = calendar.date_search(start=start, end=end, expand=True)
-                for event in events:
-                    ical = event.icalendar_instance
-                    for component in ical.walk('VEVENT'):
-                        if str(component.get('UID')) == event_uid:
-                            target_event = event
-                            logger.info(f"Событие найдено в календаре '{calendar.name}', {component.get('summary')} {component.get('dtstart').dt}")
-                            break
-                    if target_event: break
-            except Exception as e:
-                logger.debug(f"Пропуск календаря {calendar.name}: {e}")
-                continue
-            if target_event: break
-
-        if not target_event:
-            logger.error(f"Не удалось найти событие {event_uid} для сброса статусов")
-            return False
-
-        ical = target_event.icalendar_instance
-        updated = False
-
-        for component in ical.walk('VEVENT'):
-            if str(component.get('UID')) != event_uid:
-                continue
-
-            attendees = component.get('ATTENDEE')
-            if not attendees:
-                continue
-
-            if not isinstance(attendees, list):
-                attendees = [attendees]
-
-            for attendee in attendees:
-                attendee.params['PARTSTAT'] = [vText('NEEDS-ACTION')]
-                attendee.params['RSVP'] = [vText('TRUE')]
-                updated = True
-
-        if updated:
-            target_event.icalendar_instance = ical
-            try:
-                target_event.save()
-                logger.info(f"Статус 'NEEDS-ACTION' успешно установлен для всех участников события {event_uid}")
-                return True
-            except Exception as e:
-                logger.error(f"Ошибка сохранения события {event_uid}: {e}")
-                return False
-        else:
-            logger.warning(f"У события {event_uid} нет списка участников (ATTENDEE). Изменять нечего.")
-            return False
-
-    except Exception as e:
-        logger.exception(f"Критический сбой функции set_all_attendees_needs_action: {e}")
-        return False
-
 def poll_events():
     client = DAVClient(WEB_CALDAV_URL, username=CALDAV_USERNAME, password=CALDAV_PASSWORD)
     principal = client.principal()
@@ -807,7 +734,6 @@ def poll_events():
         )
         for stale_key in stale_keys:
             try:
-                set_all_attendees_needs_action(stale_key.event_uid)
                 delete_sent_event(stale_key)
             except Exception as e:
                 logger.error(
