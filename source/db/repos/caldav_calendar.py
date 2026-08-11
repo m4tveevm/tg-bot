@@ -6,7 +6,7 @@ from source.migrations.models import CalDavSendData
 
 
 def get_sent_event_keys() -> set[SentEventKey]:
-    """Return the notification keys currently stored in the database."""
+    """Возвращает ключи отправленных уведомлений из базы данных."""
     with get_session() as session:
         stmt = select(
             CalDavSendData.tg_id,
@@ -73,7 +73,7 @@ def save_event_send(
 
 
 def delete_sent_event(key: SentEventKey) -> None:
-    """Delete one exact notification record."""
+    """Удаляет точную запись отправленного уведомления."""
     with get_session() as session:
         stmt = delete(CalDavSendData).where(
             CalDavSendData.tg_id == key.telegram_id,

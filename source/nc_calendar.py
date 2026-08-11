@@ -637,7 +637,11 @@ def poll_events():
                                     if email is None:
                                         continue
                                     teg_id = get_tg_id_by_email(email)
+                                    if teg_id is None:
+                                        continue
                                     event_key = pending_event_keys.get(teg_id)
+                                    if event_key is None:
+                                        continue
 
                                     tz_user = get_timezone(teg_id)
 

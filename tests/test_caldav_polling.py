@@ -155,11 +155,13 @@ def _run_poll_cycle(
     cooldowns: list[int] | None = None,
     sender: Mock | None = None,
     mutator: Mock | None = None,
+    timezone_getter: Mock | None = None,
 ) -> tuple[Mock, Mock]:
     FrozenDateTime.current = now
     principal = FakePrincipal(calendars)
     sender = sender or Mock()
     mutator = mutator or Mock()
+    timezone_getter = timezone_getter or Mock(return_value=3)
 
     def stop_polling(_seconds: int) -> None:
         raise StopPolling
@@ -178,7 +180,7 @@ def _run_poll_cycle(
         "get_tg_id_by_email",
         (identities or {}).get,
     )
-    monkeypatch.setattr(nc_calendar, "get_timezone", lambda _id: 3)
+    monkeypatch.setattr(nc_calendar, "get_timezone", timezone_getter)
     monkeypatch.setattr(
         nc_calendar,
         "format_to_timezone",
@@ -308,6 +310,7 @@ def test_observed_notification_is_not_deleted(
     )
     event = _weekly_event(now)
     sender = Mock()
+    timezone_getter = Mock(return_value=3)
 
     _run_poll_cycle(
         nc_calendar,
@@ -317,11 +320,46 @@ def test_observed_notification_is_not_deleted(
         now=now,
         identities={USER_EMAIL: USER_ID},
         sender=sender,
+        timezone_getter=timezone_getter,
     )
 
     assert state.keys == {key}
     assert state.deleted == []
     sender.assert_not_called()
+    timezone_getter.assert_not_called()
+    event.save.assert_not_called()
+
+
+def test_participant_without_telegram_id_is_skipped(
+    nc_calendar: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = InMemoryNotificationState()
+    now = FrozenDateTime(
+        2026,
+        8,
+        6,
+        18,
+        tzinfo=nc_calendar.TEAM_TZ,
+    )
+    event = _weekly_event(now, email="unknown@example.com")
+    sender = Mock()
+    timezone_getter = Mock(return_value=3)
+
+    _run_poll_cycle(
+        nc_calendar,
+        monkeypatch,
+        state=state,
+        calendars=[FakeCalendar([event])],
+        now=now,
+        sender=sender,
+        timezone_getter=timezone_getter,
+    )
+
+    assert state.keys == set()
+    assert state.saved == []
+    sender.assert_not_called()
+    timezone_getter.assert_not_called()
     event.save.assert_not_called()
 
 
