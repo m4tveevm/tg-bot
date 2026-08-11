@@ -1,0 +1,37 @@
+[tool.ruff]
+target-version = "py311"
+line-length = 79
+indent-width = 4
+
+[tool.ruff.lint]
+select = [
+    "E4",
+    "E7",
+    "E9",
+    "E501",
+    "F",
+    "I",
+    "B",
+    "C4",
+    "SIM",
+    "UP",
+    "RUF",
+    "PT",
+    "W505",
+]
+
+[tool.ruff.lint.pycodestyle]
+max-doc-length = 72
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "auto"
+
+[tool.pytest.ini_options]
+minversion = "9.1"
+testpaths = ["tests"]
+addopts = [
+    "--strict-config",
+    "--strict-markers",
+]

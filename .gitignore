@@ -10,3 +10,6 @@ source/db/__pycache__/
 source/db/repos/__pycache__/
 source/migrations/__pycache__/
 alembic
+__pycache__/
+.coverage
+.pytest_cache/
