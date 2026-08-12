@@ -41,6 +41,7 @@ jobs:
         run: |
           ruff check . --select E9,F63,F7,F82
           ruff check \
+            source/calendar_time.py \
             source/caldav_notification_state.py \
             source/db/repos/caldav_calendar.py \
             source/timezone.py \
@@ -56,6 +57,7 @@ jobs:
       - name: Check Ruff formatting
         run: |
           ruff format --check \
+            source/calendar_time.py \
             source/caldav_notification_state.py \
             source/db/repos/caldav_calendar.py \
             source/timezone.py \

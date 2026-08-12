@@ -35,6 +35,7 @@ pythonpath = ["."]
 addopts = [
     "--strict-config",
     "--strict-markers",
+    "--cov=source.calendar_time",
     "--cov=source.caldav_notification_state",
     "--cov=source.timezone",
     "--cov-branch",
