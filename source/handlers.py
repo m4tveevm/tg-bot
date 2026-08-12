@@ -3,7 +3,15 @@ from telebot.types import (InlineKeyboardMarkup, InlineKeyboardButton, WebAppInf
 from source.app_logging import logger
 from source.connections.bot_factory import bot
 from source.connections.sender import send_message_limited
-from source.db.repos.users import get_login_by_tg_id, save_login_to_db, save_login_token, delete_login_token, get_token, get_nc_token, get_email_by_tg_id, save_timezone
+from source.db.repos.users import (
+    clear_timezone_override,
+    delete_login_token,
+    get_email_by_tg_id,
+    get_login_by_tg_id,
+    get_nc_token,
+    save_login_token,
+    set_timezone_override,
+)
 from source.db.repos.tasks import save_task_to_db, get_tasks_from_users, save_task_comment, get_task_stat, upsert_task_stats
 from source.db.repos.boards import save_board_topic
 from source.connections.nextcloud_api import fetch_user_tasks, get_board_title
@@ -12,6 +20,11 @@ from source.config import COMMIT_HASH, WEB_APP_URL, OCS_BASE_URL, HEADERS
 from requests import post
 
 from source.nc_calendar import get_calendar
+from source.timezone_command import (
+    TIMEZONE_HELP,
+    InvalidTimezoneInput,
+    apply_timezone_argument,
+)
 
 
 @bot.message_handler(commands=['start'])
@@ -282,16 +295,29 @@ def timezone_handler(message):
     chat_id = message.chat.id
     user_id = message.from_user.id
 
-    command_data = message.text.split()
-    if len(command_data) < 2:
-        send_message_limited(chat_id, "Формат: \"/timezone [+/-]N\"\nПример: /timezone +4\nВремя ставить в формате UTC")
+    command_data = message.text.split(maxsplit=1)
+    if len(command_data) != 2:
+        send_message_limited(chat_id, TIMEZONE_HELP)
         return
+
     try:
-        save_timezone(user_id, int(command_data[1]))
-    except Exception as e:
-        logger.error("TIMEZONE: ой")
+        result = apply_timezone_argument(
+            command_data[1],
+            save_override=lambda tzid: set_timezone_override(
+                user_id,
+                tzid,
+            ),
+            clear_override=lambda: clear_timezone_override(user_id),
+        )
+    except InvalidTimezoneInput:
+        send_message_limited(chat_id, TIMEZONE_HELP)
+        return
+    except Exception:
+        logger.exception("TIMEZONE: database update failed")
+        send_message_limited(
+            chat_id,
+            "Не удалось сохранить timezone. Попробуйте ещё раз позже.",
+        )
+        return
 
-
-    send_message_limited(chat_id, f"Твоя зона изменена, поздравляю с переездом!")
-
-
+    send_message_limited(chat_id, result)
