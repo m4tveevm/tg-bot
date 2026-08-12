@@ -1,7 +1,13 @@
 from source.config import WEB_CALDAV_URL, USERNAME, PASSWORD, COOLDOWN_TUESDAY, COOLDOWN_SUNDAY, COOLDOWN_DEFAULT, \
-    POLL_INTERVAL, WEB_APP_URL, UPDATE_INTERVAL, TIMEZONE, CALDAV_USERNAME, CALDAV_PASSWORD, CALDAV_COOLDOWNS, TIMEZONES
+    POLL_INTERVAL, WEB_APP_URL, UPDATE_INTERVAL, TIMEZONE, CALDAV_USERNAME, CALDAV_PASSWORD, CALDAV_COOLDOWNS
 from source.connections.sender import send_message_limited
-from source.db.repos.users import get_tg_id_by_email, save_email_by_username, get_timezone
+from source.datetime_formatting import format_calendar_time
+from source.db.repos.users import (
+    NEXTCLOUD_FIELD_MISSING,
+    get_effective_timezone,
+    get_tg_id_by_email,
+    update_nextcloud_profile,
+)
 from source.app_logging import logger
 from source.caldav_notification_state import SentEventKey, find_stale_keys
 from source.db.repos.caldav_calendar import (
@@ -13,7 +19,7 @@ from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 from caldav import DAVClient, error
 from icalendar import Calendar, vText
-from datetime import datetime, timedelta, timezone, time, date
+from datetime import date, datetime, time, timedelta, timezone, tzinfo
 
 from time import sleep
 from zoneinfo import ZoneInfo
@@ -64,7 +70,10 @@ def msg_design_from_button(uid: str, teg_id: int, type_msg: int):
                         start_dt = component.get("dtstart").dt if component.get("dtstart") else "Неизвестно"
                         end_dt = component.get("dtend").dt if component.get("dtend") else "Неизвестно"
 
-                        tz_user = get_timezone(teg_id)
+                        tz_user = get_effective_timezone(
+                            teg_id,
+                            default_tzid=TIMEZONE,
+                        )
 
                         if isinstance(start_dt, datetime):
                             start_dt_str = format_to_timezone(start_dt, tz=tz_user) if start_dt else "Неизвестно"
@@ -195,20 +204,54 @@ def cleanup_uid(target_uid: str):
         except Exception as e:
             print(e)
 
-def format_to_timezone(dt: datetime, tz: int) -> str:
-    """Преобразует datetime в указанный UTC-сдвиг и возвращает время ЧЧ:ММ."""
+def format_to_timezone(dt: datetime, tz: tzinfo) -> str:
+    """Преобразует datetime в timezone и возвращает время ЧЧ:ММ."""
     if not isinstance(dt, datetime):
         return str(dt)
 
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
+    return format_calendar_time(dt, tz)
 
-    tz = TIMEZONES.get(tz)
-    if tz is None:
-        logger.error(f"CALDAV: Неизвестный UTC-сдвиг: {tz}")
-        tz = 3
 
-    return dt.astimezone(tz).strftime("%H:%M")
+def sync_nextcloud_users_once(
+    *,
+    request_get=requests.get,
+    update_profile=update_nextcloud_profile,
+) -> int:
+    """Read and persist Nextcloud profiles once without remote writes."""
+    headers = {
+        "OCS-APIRequest": "true",
+        "Accept": "application/json",
+    }
+    auth = (USERNAME, PASSWORD)
+    users_endpoint = f"{WEB_APP_URL}/ocs/v1.php/cloud/users?limit=1000"
+    response = request_get(users_endpoint, headers=headers, auth=auth)
+    response.raise_for_status()
+    user_ids = response.json().get("ocs", {}).get("data", {}).get(
+        "users",
+        [],
+    )
+
+    updated_count = 0
+    for uid in user_ids:
+        detail_endpoint = f"{WEB_APP_URL}/ocs/v1.php/cloud/users/{uid}"
+        detail_response = request_get(
+            detail_endpoint,
+            headers=headers,
+            auth=auth,
+        )
+        detail_response.raise_for_status()
+        user_data = detail_response.json().get("ocs", {}).get("data", {})
+        updated = update_profile(
+            uid,
+            email=user_data.get("email", NEXTCLOUD_FIELD_MISSING),
+            timezone_value=user_data.get(
+                "timezone",
+                NEXTCLOUD_FIELD_MISSING,
+            ),
+        )
+        updated_count += int(updated)
+
+    return updated_count
 
 def sync_nextcloud_users():
     """
@@ -216,53 +259,18 @@ def sync_nextcloud_users():
     ВНИМАНИЕ: Пользователь (USERNAME), указанный в конфиге,
     должен иметь права Администратора в Nextcloud.
     """
-    headers = {
-        "OCS-APIRequest": "true",
-        "Accept": "application/json"
-    }
-
-    auth = (USERNAME, PASSWORD)
     while True:
         logger.info(f"NEXTCLOUD: Начинаю синхронизацию пользователей (частота {UPDATE_INTERVAL} дней)...")
         try:
-
-            users_endpoint = f"{WEB_APP_URL}/ocs/v1.php/cloud/users?limit=1000"
-            response = requests.get(users_endpoint, headers=headers, auth=auth)
-
-            if response.status_code != 200:
-                logger.error(
-                    f"CLOUD: Ошибка доступа к API. Код: {response.status_code}. Проверьте, является ли {USERNAME} админом.")
-                return
-
-            data = response.json()
-            try:
-                user_ids = data.get('ocs', {}).get('data', {}).get('users', {})
-            except AttributeError:
-                return
-
-            updated_count = 0
-            for uid in user_ids:
-                detail_endpoint = f"{WEB_APP_URL}/ocs/v1.php/cloud/users/{uid}"
-                detail_res = requests.get(detail_endpoint, headers=headers, auth=auth)
-                detail_res.raise_for_status()
-                if detail_res.status_code == 200:
-                    user_data = detail_res.json().get('ocs', {}).get('data', {})
-                    try:
-                        email = user_data.get('email', '').strip().lower()
-                    except AttributeError:
-                        continue
-                    if email:
-                        save_email_by_username(
-                            nc_login=uid,
-                            nc_email=email,
-                        )
-                        updated_count += 1
-
-            logger.info(f"CLOUD: Успешно синхронизировано {updated_count} пользователей с почтой.")
-            sleep(86400 * UPDATE_INTERVAL)
+            updated_count = sync_nextcloud_users_once()
+            logger.info(
+                "CLOUD: Синхронизировано профилей: %s",
+                updated_count,
+            )
 
         except Exception as e:
             logger.exception(f"CLOUD: Критическая ошибка при синхронизации пользователей: {e}")
+        sleep(86400 * UPDATE_INTERVAL)
 
 def get_all_participants(component):
     """
@@ -334,7 +342,10 @@ def get_calendar(teg_id, cooldown=6, all_events=False):
                         start_dt = component.get("dtstart").dt if component.get("dtstart") else "Неизвестно"
                         end_dt = component.get("dtend").dt if component.get("dtend") else "Неизвестно"
 
-                        tz_user = get_timezone(teg_id)
+                        tz_user = get_effective_timezone(
+                            teg_id,
+                            default_tzid=TIMEZONE,
+                        )
 
                         if component.get("dtstart").dt < start and component.get("dtstart").dt > end:
                             continue
@@ -643,7 +654,10 @@ def poll_events():
                                     if event_key is None:
                                         continue
 
-                                    tz_user = get_timezone(teg_id)
+                                    tz_user = get_effective_timezone(
+                                        teg_id,
+                                        default_tzid=TIMEZONE,
+                                    )
 
                                     if isinstance(start_dt, datetime):
                                         start_dt_str = format_to_timezone(start_dt, tz=tz_user) if start_dt else "Неизвестно"
