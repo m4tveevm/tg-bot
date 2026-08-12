@@ -2,14 +2,20 @@ import time
 import re
 import difflib
 import traceback
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone, tzinfo
 from collections import Counter
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-from source.config import POLL_INTERVAL, EXCLUDED_CARD_IDS, ARCHIVE_AFTER_DAYS, TIMEZONES
+from source.config import (
+    ARCHIVE_AFTER_DAYS,
+    EXCLUDED_CARD_IDS,
+    POLL_INTERVAL,
+    TIMEZONE,
+)
+from source.datetime_formatting import format_task_due_date
 from source.connections.sender import send_message_limited
 from source.connections.nextcloud_api import fetch_all_tasks, in_done_stack, archive_card, get_url_attachment
-from source.db.repos.users import get_user_map, get_timezone
+from source.db.repos.users import get_effective_timezone, get_user_map
 from source.db.repos.tasks import (
     get_saved_tasks, save_task_to_db, update_task_in_db,
     get_task_assignees, save_task_assignee, delete_task_assignee,
@@ -23,20 +29,32 @@ from source.app_logging import logger, is_debug
 from source.logging_service import send_log
 from source.links import card_url
 
-def format_to_timezone(dt: datetime, tz: int) -> str:
-    """Преобразует datetime в указанный UTC-сдвиг и возвращает время ЧЧ:ММ."""
+def format_to_timezone(dt: datetime, tz: tzinfo) -> str:
+    """Преобразует UTC datetime в timezone пользователя."""
     if not isinstance(dt, datetime):
         return str(dt)
 
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
+    return format_task_due_date(dt, tz)
 
-    tz = TIMEZONES.get(tz)
-    if tz is None:
-        logger.error(f"CALDAV: Неизвестный UTC-сдвиг: {tz}")
-        tz = 3
 
-    return dt.astimezone(tz).strftime("%y-%m-%d %H:%M")
+def _format_changes_for_timezone(
+    changes: list,
+    target_timezone: tzinfo,
+) -> list[str]:
+    formatted: list[str] = []
+    for change in changes:
+        if not isinstance(change, list):
+            formatted.append(str(change))
+            continue
+
+        old_due = change[0] if change[0] else "—"
+        new_due = change[1] if change[1] else "—"
+        if isinstance(old_due, datetime):
+            old_due = format_to_timezone(old_due, target_timezone)
+        if isinstance(new_due, datetime):
+            new_due = format_to_timezone(new_due, target_timezone)
+        formatted.append(f"Due: `{old_due or '—'}` → `{new_due or '—'}`")
+    return formatted
 
 def change_description(old_description, new_description):
     """
@@ -364,8 +382,11 @@ def poll_new_tasks():
                                     callback_data=f"move:{item['board_id']}:{item['stack_id']}:{card_id}:{next_stack_id}"
                                 ))
 
-                            need_zone = get_timezone(tg_id)
-                            duedat = item['duedate'].dt if item['duedate'] else "—"
+                            need_zone = get_effective_timezone(
+                                tg_id,
+                                default_tzid=TIMEZONE,
+                            )
+                            duedat = item['duedate'] or "—"
                             if isinstance(duedat, datetime):
                                 duedat_str = format_to_timezone(duedat, tz=need_zone) if duedat else "—"
                             else:
@@ -406,43 +427,32 @@ def poll_new_tasks():
                     kb = InlineKeyboardMarkup()
                     kb.add(InlineKeyboardButton(text="Открыть на клауде", url=card_url(item["board_id"], card_id)))
                     for tg_id in tg_ids:
-                        need_zone = get_timezone(tg_id)
-                        for i in range(len(changes)):
-                            if isinstance(changes[i], list):
-                                od = changes[i][0].dt if changes[i][0] else "—"
-                                if isinstance(od, datetime):
-                                    od = format_to_timezone(od, tz=need_zone) if od else "—"
-                                else:
-                                    od = str(od)
-
-                                nd = changes[i][1].dt if changes[i][1] else "—"
-                                if isinstance(nd, datetime):
-                                    nd = format_to_timezone(nd, tz=need_zone) if nd else "—"
-                                else:
-                                    nd = str(nd)
-                                changes[i] = f"Due: `{od or '—'}` → `{nd or '—'}`"
+                        need_zone = get_effective_timezone(
+                            tg_id,
+                            default_tzid=TIMEZONE,
+                        )
+                        user_changes = _format_changes_for_timezone(
+                            changes,
+                            need_zone,
+                        )
                         send_message_limited(
                             tg_id,
-                            f"✏️ *Изменения в карточке* «{item['title']}» (ID {cid_link}):\n" + "\n".join(changes),
+                            f"✏️ *Изменения в карточке* «{item['title']}» "
+                            f"(ID {cid_link}):\n" + "\n".join(user_changes),
                             reply_markup=kb,
                         )
 
-                    for i in range(len(changes)):
-                        if isinstance(changes[i], list):
-                            od = changes[i][0].dt if changes[i][0] else "—"
-                            if isinstance(od, datetime):
-                                od = format_to_timezone(od, tz=3) if od else "—"
-                            else:
-                                od = str(od)
-
-                            nd = changes[i][1].dt if changes[i][1] else "—"
-                            if isinstance(nd, datetime):
-                                nd = format_to_timezone(nd, tz=3) if nd else "—"
-                            else:
-                                nd = str(nd)
-                            changes[i] = f"Due: `{od or '—'}` → `{nd or '—'}`"
+                    team_zone = get_effective_timezone(
+                        None,
+                        default_tzid=TIMEZONE,
+                    )
+                    team_changes = _format_changes_for_timezone(
+                        changes,
+                        team_zone,
+                    )
                     send_log(
-                        f"✏️ *Изменения в карточке* «{item['title']}»:\n" + "\n".join(changes),
+                        f"✏️ *Изменения в карточке* «{item['title']}»:\n"
+                        + "\n".join(team_changes),
                         board_id=item['board_id'],
                         reply_markup=kb,
                     )
