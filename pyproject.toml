@@ -31,10 +31,12 @@ line-ending = "auto"
 [tool.pytest.ini_options]
 minversion = "9.1"
 testpaths = ["tests"]
+pythonpath = ["."]
 addopts = [
     "--strict-config",
     "--strict-markers",
     "--cov=source.caldav_notification_state",
+    "--cov=source.timezone",
     "--cov-branch",
     "--cov-report=term-missing",
     "--cov-fail-under=100",
