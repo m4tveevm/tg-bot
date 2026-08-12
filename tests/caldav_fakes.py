@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
 from typing import ClassVar
 from unittest.mock import Mock
 
@@ -23,7 +23,8 @@ class FrozenDateTime(datetime):
 
 @dataclass(frozen=True)
 class DateProperty:
-    dt: datetime
+    dt: datetime | date
+    params: dict[str, object] = field(default_factory=dict)
 
 
 class FakeComponent:
@@ -82,6 +83,7 @@ class FakeCalendar:
         self.error = error
         self.name = name
         self.expand_calls: list[bool] = []
+        self.search_calls: list[tuple[object, object]] = []
 
     def date_search(
         self,
@@ -91,6 +93,7 @@ class FakeCalendar:
         expand: bool = False,
     ) -> list[FakeEvent]:
         self.expand_calls.append(expand)
+        self.search_calls.append((start, end))
         if self.error is not None:
             raise self.error
 
@@ -190,18 +193,22 @@ def make_poll_event(
     *,
     event_uid: str,
     summary: str,
-    start: datetime,
-    end: datetime,
+    start: datetime | date,
+    end: datetime | date,
     participants: list[dict[str, object]],
     ical_attendees: FakeAttendee | list[FakeAttendee] | None = None,
+    start_tzid: str | None = None,
+    end_tzid: str | None = None,
 ) -> FakeEvent:
+    start_params = {"TZID": start_tzid} if start_tzid is not None else {}
+    end_params = {"TZID": end_tzid} if end_tzid is not None else {}
     values = {
         "UID": event_uid,
         "SUMMARY": summary,
         "DESCRIPTION": "Weekly team sync",
         "LOCATION": "Online",
-        "DTSTART": DateProperty(start),
-        "DTEND": DateProperty(end),
+        "DTSTART": DateProperty(start, start_params),
+        "DTEND": DateProperty(end, end_params),
     }
     if ical_attendees is not None:
         values["ATTENDEE"] = ical_attendees

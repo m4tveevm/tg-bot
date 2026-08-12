@@ -1,6 +1,12 @@
 from source.config import WEB_CALDAV_URL, USERNAME, PASSWORD, COOLDOWN_TUESDAY, COOLDOWN_SUNDAY, COOLDOWN_DEFAULT, \
     POLL_INTERVAL, WEB_APP_URL, UPDATE_INTERVAL, TIMEZONE, CALDAV_USERNAME, CALDAV_PASSWORD, CALDAV_COOLDOWNS
 from source.connections.sender import send_message_limited
+from source.calendar_time import (
+    UnknownSourceTimezoneError,
+    local_day_window,
+    local_week_window,
+    localize_ical_value,
+)
 from source.datetime_formatting import format_calendar_time
 from source.db.repos.users import (
     NEXTCLOUD_FIELD_MISSING,
@@ -19,12 +25,14 @@ from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 from caldav import DAVClient, error
 from icalendar import Calendar, vText
-from datetime import date, datetime, time, timedelta, timezone, tzinfo
+from datetime import date, datetime, time, timedelta, timezone
 
 from time import sleep
 from zoneinfo import ZoneInfo
 
 import requests
+
+_DATETIME_TYPE = datetime
 
 try:
     TEAM_TZ = ZoneInfo(TIMEZONE)
@@ -49,9 +57,58 @@ WEEKDAY_RU = {
     None: " ОПРЕДЕЛЕННЫЙ ДЕНЬ"
 }
 
+
+def _source_tzid(property_value) -> str | None:
+    params = getattr(property_value, "params", {})
+    source_tzid = params.get("TZID")
+    if source_tzid is None:
+        return None
+
+    return str(source_tzid)
+
+
+def _localized_component_value(component, name: str, target_timezone):
+    property_value = component.get(name)
+    if property_value is None:
+        return "Неизвестно"
+
+    return localize_ical_value(
+        property_value.dt,
+        target_timezone=target_timezone,
+        source_tzid=_source_tzid(property_value),
+    )
+
+
+def _format_localized_value(value) -> str:
+    if isinstance(value, _DATETIME_TYPE):
+        return format_calendar_time(value)
+
+    return str(value)
+
+
+def _localized_sort_key(item):
+    value = item[0]
+    if isinstance(value, _DATETIME_TYPE):
+        return (
+            value.date().toordinal(),
+            value.hour,
+            value.minute,
+            value.second,
+            value.microsecond,
+        )
+    if isinstance(value, date):
+        return (value.toordinal(), 0, 0, 0, 0)
+
+    return (float("inf"), 0, 0, 0, 0)
+
+
 def msg_design_from_button(uid: str, teg_id: int, type_msg: int):
     start = datetime.now(TEAM_TZ)
     end = start + timedelta(days=6)
+    tz_user = get_effective_timezone(
+        teg_id,
+        default_tzid=TIMEZONE,
+    )
     client = DAVClient(WEB_CALDAV_URL, username=CALDAV_USERNAME, password=CALDAV_PASSWORD)
     principal = client.principal()
     res = ''
@@ -67,23 +124,18 @@ def msg_design_from_button(uid: str, teg_id: int, type_msg: int):
                         description = str(component.get("description", "Нет описания"))
                         location = str(component.get("location", "Не указана"))
 
-                        start_dt = component.get("dtstart").dt if component.get("dtstart") else "Неизвестно"
-                        end_dt = component.get("dtend").dt if component.get("dtend") else "Неизвестно"
-
-                        tz_user = get_effective_timezone(
-                            teg_id,
-                            default_tzid=TIMEZONE,
+                        start_dt = _localized_component_value(
+                            component,
+                            "dtstart",
+                            tz_user,
                         )
-
-                        if isinstance(start_dt, datetime):
-                            start_dt_str = format_to_timezone(start_dt, tz=tz_user) if start_dt else "Неизвестно"
-                        else:
-                            start_dt_str = str(start_dt)
-
-                        if isinstance(end_dt, datetime):
-                            end_dt_str = format_to_timezone(end_dt, tz=tz_user) if end_dt else "Неизвестно"
-                        else:
-                            end_dt_str = str(end_dt)
+                        end_dt = _localized_component_value(
+                            component,
+                            "dtend",
+                            tz_user,
+                        )
+                        start_dt_str = _format_localized_value(start_dt)
+                        end_dt_str = _format_localized_value(end_dt)
 
                         if type_msg == 2:
                             res += (f'📅 *СЕГОДНЯ СОБЫТИЕ В{WEEKDAY_RU.get(start_dt.weekday(), "ОПРЕДЕЛЕННЫЙ ДЕНЬ")}*\n'
@@ -204,14 +256,6 @@ def cleanup_uid(target_uid: str):
         except Exception as e:
             print(e)
 
-def format_to_timezone(dt: datetime, tz: tzinfo) -> str:
-    """Преобразует datetime в timezone и возвращает время ЧЧ:ММ."""
-    if not isinstance(dt, datetime):
-        return str(dt)
-
-    return format_calendar_time(dt, tz)
-
-
 def sync_nextcloud_users_once(
     *,
     request_get=requests.get,
@@ -311,13 +355,17 @@ def get_all_participants(component):
 
 
 def get_calendar(teg_id, cooldown=6, all_events=False):
-    start = datetime.now(TEAM_TZ)
+    tz_user = get_effective_timezone(
+        teg_id,
+        default_tzid=TIMEZONE,
+    )
+    now_utc = datetime.now(timezone.utc)
     if cooldown == 1:
-        end = start.replace(hour=23, minute=59, second=59, microsecond=999999)
-    elif cooldown == 7:
-        start = start.replace(hour=0, minute=0, second=0, microsecond=0)
-        end = start + timedelta(days=cooldown - 1)
+        start, end = local_day_window(now_utc, tz_user)
+    elif cooldown in (6, 7):
+        start, end = local_week_window(now_utc, tz_user)
     else:
+        start = now_utc
         end = start + timedelta(days=cooldown)
 
     result = []
@@ -339,28 +387,20 @@ def get_calendar(teg_id, cooldown=6, all_events=False):
                         description = str(component.get("description", "Нет описания"))
                         location = str(component.get("location", "Не указана"))
 
-                        start_dt = component.get("dtstart").dt if component.get("dtstart") else "Неизвестно"
-                        end_dt = component.get("dtend").dt if component.get("dtend") else "Неизвестно"
-
-                        tz_user = get_effective_timezone(
-                            teg_id,
-                            default_tzid=TIMEZONE,
+                        start_dt = _localized_component_value(
+                            component,
+                            "dtstart",
+                            tz_user,
+                        )
+                        end_dt = _localized_component_value(
+                            component,
+                            "dtend",
+                            tz_user,
                         )
 
-                        if component.get("dtstart").dt < start and component.get("dtstart").dt > end:
-                            continue
-
                         short_url = event_uid
-
-                        if isinstance(start_dt, datetime):
-                            start_dt_str = format_to_timezone(start_dt, tz=tz_user) if start_dt else "Неизвестно"
-                        else:
-                            start_dt_str = str(start_dt)
-
-                        if isinstance(end_dt, datetime):
-                            end_dt_str = format_to_timezone(end_dt, tz=tz_user) if end_dt else "Неизвестно"
-                        else:
-                            end_dt_str = str(end_dt)
+                        start_dt_str = _format_localized_value(start_dt)
+                        end_dt_str = _format_localized_value(end_dt)
 
                         res += (f'📅 *СОБЫТИЕ В{WEEKDAY_RU.get(start_dt.weekday(), "ОПРЕДЕЛЕННЫЙ ДЕНЬ")}*\n'
                                 f'{summary}\n'
@@ -447,16 +487,7 @@ def get_calendar(teg_id, cooldown=6, all_events=False):
             logger.error(f"CALDAV: {e}")
             return None
 
-    def get_sort_key(item):
-        dt = item[0]
-        if isinstance(dt, datetime):
-            return dt.timestamp()
-        elif isinstance(dt, date):
-            return datetime.combine(dt, datetime.min.time()).timestamp()
-
-        return float('inf')
-
-    result.sort(key=get_sort_key)
+    result.sort(key=_localized_sort_key)
 
     final_result = [item[1] for item in result]
 
@@ -548,9 +579,8 @@ def poll_events():
     while True:
         logger.info(f"CALDAV: Получаю события...")
 
-        start = datetime.now(TEAM_TZ)
-
-        end = start + timedelta(days=1)
+        now_utc = datetime.now(timezone.utc)
+        end_utc = now_utc + timedelta(hours=24)
         saved_event_keys = get_sent_event_keys()
         observed_event_keys: set[SentEventKey] = set()
         scan_complete = True
@@ -564,7 +594,7 @@ def poll_events():
 
         for calendar in calendars:
             try:
-                events = calendar.date_search(start=start, end=end)
+                events = calendar.date_search(start=now_utc, end=end_utc)
             except Exception as e:
                 logger.error(f"CALDAV: Ошибка поиска событий в календаре: {e}")
                 scan_complete = False
@@ -577,6 +607,13 @@ def poll_events():
 
                     for component in cal.walk():
                         if component.name == "VEVENT":
+                            start_property = component.get("dtstart")
+                            if start_property is None:
+                                continue
+                            start_dt = start_property.dt
+                            if not isinstance(start_dt, datetime):
+                                continue
+
                             event_uid = str(component.get("uid"))
                             if component.get("uid") is None:
                                 event_uid = str(component.get("dtstart"))
@@ -587,22 +624,15 @@ def poll_events():
                             summary = str(component.get("summary", "Без названия"))
                             description = str(component.get("description", "Нет описания"))
                             location = str(component.get("location", "Не указана"))
-                            start_dt = component.get("dtstart").dt if component.get("dtstart") else "Неизвестно"
-                            end_dt = component.get("dtend").dt if component.get("dtend") else "Неизвестно"
+                            end_property = component.get("dtend")
                             cooldowns = []
-                            if not isinstance(start_dt, str):
-                                find_need_event = False
-                                for key, value in CALDAV_COOLDOWNS.items():
-                                    if summary.startswith(key):
-                                        for i in value:
-                                            if (start_dt - start) <= timedelta(minutes=i):
-                                                find_need_event = True
-                                                cooldowns = value
-                                                break
-                                        break
+                            for key, value in CALDAV_COOLDOWNS.items():
+                                if summary.startswith(key):
+                                    cooldowns = value
+                                    break
 
-                                if not find_need_event:
-                                    continue
+                            if not cooldowns:
+                                continue
 
 
 
@@ -610,7 +640,7 @@ def poll_events():
 
                             attendees = get_all_participants(component)
                             name_for_send = ""
-                            pending_event_keys: dict[int, SentEventKey] = {}
+                            pending_event_contexts = {}
                             if attendees:
                                 for user in attendees:
                                     email = user.get('email')
@@ -619,6 +649,7 @@ def poll_events():
                                     tg_id_found = get_tg_id_by_email(email)
                                     if tg_id_found is None:
                                         continue
+
                                     user_event_keys = [
                                         SentEventKey(
                                             telegram_id=tg_id_found,
@@ -627,6 +658,57 @@ def poll_events():
                                         )
                                         for cooldown in cooldowns
                                     ]
+                                    tz_user = get_effective_timezone(
+                                        tg_id_found,
+                                        default_tzid=TIMEZONE,
+                                    )
+                                    try:
+                                        localized_start = (
+                                            localize_ical_value(
+                                                start_dt,
+                                                target_timezone=tz_user,
+                                                source_tzid=_source_tzid(
+                                                    start_property
+                                                ),
+                                            )
+                                        )
+
+                                        localized_end = None
+                                        if end_property is not None:
+                                            localized_end = (
+                                                localize_ical_value(
+                                                    end_property.dt,
+                                                    target_timezone=tz_user,
+                                                    source_tzid=_source_tzid(
+                                                        end_property
+                                                    ),
+                                                )
+                                            )
+                                    except UnknownSourceTimezoneError as e:
+                                        scan_complete = False
+                                        logger.error(
+                                            "CALDAV: Неизвестный TZID "
+                                            f"{e.tzid} у события "
+                                            f"{event_uid} для {email}"
+                                        )
+                                        continue
+
+                                    start_instant = (
+                                        localized_start.astimezone(
+                                            timezone.utc
+                                        )
+                                    )
+                                    time_until_start = (
+                                        start_instant - now_utc
+                                    )
+                                    if not (
+                                        timedelta() <= time_until_start
+                                        <= timedelta(
+                                            minutes=max(cooldowns)
+                                        )
+                                    ):
+                                        continue
+
                                     observed_event_keys.update(
                                         user_event_keys
                                     )
@@ -635,13 +717,23 @@ def poll_events():
                                             key
                                             for key in user_event_keys
                                             if key not in saved_event_keys
+                                            and time_until_start
+                                            <= timedelta(
+                                                minutes=(
+                                                    key.cooldown_minutes
+                                                )
+                                            )
                                         ),
                                         None,
                                     )
                                     if pending_event_key is not None:
-                                        pending_event_keys[
+                                        pending_event_contexts[
                                             tg_id_found
-                                        ] = pending_event_key
+                                        ] = (
+                                            pending_event_key,
+                                            localized_start,
+                                            localized_end,
+                                        )
 
                                 for user in attendees:
                                     email = user.get('email')
@@ -650,27 +742,39 @@ def poll_events():
                                     teg_id = get_tg_id_by_email(email)
                                     if teg_id is None:
                                         continue
-                                    event_key = pending_event_keys.get(teg_id)
-                                    if event_key is None:
-                                        continue
-
-                                    tz_user = get_effective_timezone(
-                                        teg_id,
-                                        default_tzid=TIMEZONE,
+                                    event_context = (
+                                        pending_event_contexts.get(teg_id)
                                     )
+                                    if event_context is None:
+                                        continue
+                                    (
+                                        event_key,
+                                        localized_start,
+                                        localized_end,
+                                    ) = event_context
 
-                                    if isinstance(start_dt, datetime):
-                                        start_dt_str = format_to_timezone(start_dt, tz=tz_user) if start_dt else "Неизвестно"
+                                    start_dt_str = format_calendar_time(
+                                        localized_start
+                                    )
+                                    if isinstance(
+                                        localized_end,
+                                        datetime,
+                                    ):
+                                        end_dt_str = format_calendar_time(
+                                            localized_end
+                                        )
+                                    elif localized_end is None:
+                                        end_dt_str = "Неизвестно"
                                     else:
-                                        start_dt_str = str(start_dt)
-
-                                    if isinstance(end_dt, datetime):
-                                        end_dt_str = format_to_timezone(end_dt, tz=tz_user) if end_dt else "Неизвестно"
-                                    else:
-                                        end_dt_str = str(end_dt)
+                                        end_dt_str = str(localized_end)
 
 
-                                    res = (f'📅 *СЕГОДНЯ СОБЫТИЕ В{WEEKDAY_RU.get(start_dt.weekday(), "ОПРЕДЕЛЕННЫЙ ДЕНЬ")}*\n'
+                                    localized_weekday = WEEKDAY_RU.get(
+                                        localized_start.weekday(),
+                                        "ОПРЕДЕЛЕННЫЙ ДЕНЬ",
+                                    )
+                                    res = ('📅 *СЕГОДНЯ СОБЫТИЕ В'
+                                           f'{localized_weekday}*\n'
                                            f'{summary}\n'
                                            f'{description}\n\n'
                                            f'Локация: {location}\n\n'

@@ -3,7 +3,7 @@ import importlib
 import inspect
 import sys
 import textwrap
-from datetime import timedelta
+from datetime import UTC, date, datetime, timedelta
 from types import ModuleType
 from unittest.mock import Mock
 from zoneinfo import ZoneInfo
@@ -194,11 +194,6 @@ def _run_poll_cycle(
     )
     monkeypatch.setattr(
         nc_calendar,
-        "format_to_timezone",
-        lambda _value, tz: "19:00",
-    )
-    monkeypatch.setattr(
-        nc_calendar,
         "get_all_participants",
         lambda component: component.participants,
     )
@@ -237,11 +232,314 @@ def _weekly_event(
     )
 
 
-def test_stale_cleanup_does_not_mutate_caldav(
+def test_poll_window_is_an_absolute_24_hour_interval(
     nc_calendar: ModuleType,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    state = InMemoryNotificationState({_key()})
+    state = InMemoryNotificationState()
+    calendar = FakeCalendar()
+    now = FrozenDateTime(
+        2026,
+        3,
+        29,
+        1,
+        30,
+        tzinfo=ZoneInfo("Europe/Warsaw"),
+    )
+
+    _run_poll_cycle(
+        nc_calendar,
+        monkeypatch,
+        state=state,
+        calendars=[calendar],
+        now=now,
+    )
+
+    start, end = calendar.search_calls[0]
+    assert isinstance(start, datetime)
+    assert isinstance(end, datetime)
+    assert start.tzinfo == UTC
+    assert end - start == timedelta(hours=24)
+
+
+def test_calendar_message_uses_localized_weekday_and_time(
+    nc_calendar: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = InMemoryNotificationState()
+    sender = Mock()
+    now = FrozenDateTime(2026, 8, 10, 22, tzinfo=UTC)
+    event = _weekly_event(now)
+
+    _run_poll_cycle(
+        nc_calendar,
+        monkeypatch,
+        state=state,
+        calendars=[FakeCalendar([event])],
+        now=now,
+        identities={USER_EMAIL: USER_ID},
+        sender=sender,
+        timezone_getter=Mock(return_value=ZoneInfo("Europe/Warsaw")),
+    )
+
+    message = sender.call_args.args[1]
+    assert nc_calendar.WEEKDAY_RU[1] in message
+    assert "Начало: 2026-08-11 00:30" in message
+    assert "Конец: 2026-08-11 01:30" in message
+
+
+def test_localized_weekday_changes_after_midnight(
+    nc_calendar: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = InMemoryNotificationState()
+    sender = Mock()
+    now = FrozenDateTime(2026, 8, 10, 22, tzinfo=UTC)
+    event = _weekly_event(now)
+
+    _run_poll_cycle(
+        nc_calendar,
+        monkeypatch,
+        state=state,
+        calendars=[FakeCalendar([event])],
+        now=now,
+        identities={USER_EMAIL: USER_ID},
+        sender=sender,
+        timezone_getter=Mock(return_value=ZoneInfo("Europe/Warsaw")),
+    )
+
+    message = sender.call_args.args[1]
+    assert nc_calendar.WEEKDAY_RU[1] in message
+    assert nc_calendar.WEEKDAY_RU[0] not in message
+
+
+def test_poll_cooldown_uses_recipient_zone_for_floating_start(
+    nc_calendar: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = InMemoryNotificationState()
+    sender = Mock()
+    now = FrozenDateTime(2026, 10, 25, 7, 30, tzinfo=UTC)
+    event = make_poll_event(
+        event_uid=EVENT_UID,
+        summary="Team sync",
+        start=FrozenDateTime(2026, 10, 25, 9),
+        end=FrozenDateTime(2026, 10, 25, 10),
+        participants=[_participant()],
+    )
+
+    _run_poll_cycle(
+        nc_calendar,
+        monkeypatch,
+        state=state,
+        calendars=[FakeCalendar([event])],
+        now=now,
+        identities={USER_EMAIL: USER_ID},
+        sender=sender,
+        timezone_getter=Mock(return_value=ZoneInfo("Europe/Warsaw")),
+    )
+
+    sender.assert_called_once()
+    assert state.saved == [_key()]
+
+
+def test_floating_event_is_evaluated_separately_for_each_attendee(
+    nc_calendar: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    warsaw_id = 101
+    moscow_id = 202
+    warsaw_email = "warsaw@example.com"
+    moscow_email = "moscow@example.com"
+    state = InMemoryNotificationState()
+    sender = Mock()
+    now = FrozenDateTime(2026, 10, 25, 5, 30, tzinfo=UTC)
+    event = make_poll_event(
+        event_uid=EVENT_UID,
+        summary="Team sync",
+        start=FrozenDateTime(2026, 10, 25, 9),
+        end=FrozenDateTime(2026, 10, 25, 10),
+        participants=[
+            _participant(warsaw_email),
+            _participant(moscow_email),
+        ],
+    )
+    zones = {
+        warsaw_id: ZoneInfo("Europe/Warsaw"),
+        moscow_id: ZoneInfo("Europe/Moscow"),
+    }
+
+    _run_poll_cycle(
+        nc_calendar,
+        monkeypatch,
+        state=state,
+        calendars=[FakeCalendar([event])],
+        now=now,
+        identities={
+            warsaw_email: warsaw_id,
+            moscow_email: moscow_id,
+        },
+        cooldowns=[60, 180],
+        sender=sender,
+        timezone_getter=Mock(
+            side_effect=lambda telegram_id, **_kwargs: zones[telegram_id]
+        ),
+    )
+
+    assert sender.call_count == 2
+    assert [call.args[0] for call in sender.call_args_list] == [
+        warsaw_id,
+        moscow_id,
+    ]
+    assert all(
+        "Начало: 2026-10-25 09:00" in call.args[1]
+        for call in sender.call_args_list
+    )
+    assert state.saved == [
+        _key(telegram_id=warsaw_id, cooldown=180),
+        _key(telegram_id=moscow_id, cooldown=60),
+    ]
+
+
+def test_time_localization_failure_preserves_notification_state(
+    nc_calendar: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    key = _key(event_uid="stale-event")
+    state = InMemoryNotificationState({key})
+    sender = Mock()
+    now = FrozenDateTime(2026, 8, 10, 8, 30, tzinfo=UTC)
+    event = make_poll_event(
+        event_uid=EVENT_UID,
+        summary="Team sync",
+        start=FrozenDateTime(2026, 8, 10, 9),
+        end=FrozenDateTime(2026, 8, 10, 10),
+        participants=[_participant()],
+        start_tzid="Unknown/Nowhere",
+    )
+
+    _run_poll_cycle(
+        nc_calendar,
+        monkeypatch,
+        state=state,
+        calendars=[FakeCalendar([event])],
+        now=now,
+        identities={USER_EMAIL: USER_ID},
+        sender=sender,
+        timezone_getter=Mock(return_value=ZoneInfo("Europe/Warsaw")),
+    )
+
+    assert state.keys == {key}
+    assert state.deleted == []
+    assert state.saved == []
+    sender.assert_not_called()
+    event.save.assert_not_called()
+
+
+def test_localization_failure_for_one_recipient_does_not_abort_others(
+    nc_calendar: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    warsaw_id = 101
+    moscow_id = 202
+    warsaw_email = "warsaw@example.com"
+    moscow_email = "moscow@example.com"
+    stale_key = _key(event_uid="stale-event")
+    state = InMemoryNotificationState({stale_key})
+    sender = Mock()
+    now = FrozenDateTime(2026, 8, 10, 5, 30, tzinfo=UTC)
+    event = make_poll_event(
+        event_uid=EVENT_UID,
+        summary="Team sync",
+        start=FrozenDateTime(2026, 8, 10, 9),
+        end=FrozenDateTime(2026, 8, 10, 10),
+        participants=[
+            _participant(warsaw_email),
+            _participant(moscow_email),
+        ],
+    )
+    zones = {
+        warsaw_id: ZoneInfo("Europe/Warsaw"),
+        moscow_id: ZoneInfo("Europe/Moscow"),
+    }
+    localize_ical_value = nc_calendar.localize_ical_value
+
+    def localize_for_recipient(value, *, target_timezone, source_tzid):
+        if target_timezone == zones[warsaw_id]:
+            raise nc_calendar.UnknownSourceTimezoneError("Unknown/Nowhere")
+
+        return localize_ical_value(
+            value,
+            target_timezone=target_timezone,
+            source_tzid=source_tzid,
+        )
+
+    monkeypatch.setattr(
+        nc_calendar,
+        "localize_ical_value",
+        localize_for_recipient,
+    )
+
+    _run_poll_cycle(
+        nc_calendar,
+        monkeypatch,
+        state=state,
+        calendars=[FakeCalendar([event])],
+        now=now,
+        identities={
+            warsaw_email: warsaw_id,
+            moscow_email: moscow_id,
+        },
+        sender=sender,
+        timezone_getter=Mock(
+            side_effect=lambda telegram_id, **_kwargs: zones[telegram_id]
+        ),
+    )
+
+    sender.assert_called_once()
+    assert sender.call_args.args[0] == moscow_id
+    assert state.keys == {stale_key, _key(telegram_id=moscow_id)}
+    assert state.saved == [_key(telegram_id=moscow_id)]
+    assert state.deleted == []
+    event.save.assert_not_called()
+
+
+def test_periodic_poller_skips_all_day_event(
+    nc_calendar: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = InMemoryNotificationState()
+    sender = Mock()
+    timezone_getter = Mock(return_value=ZoneInfo("Europe/Warsaw"))
+    event = make_poll_event(
+        event_uid=EVENT_UID,
+        summary="Team sync",
+        start=date(2026, 8, 10),
+        end=date(2026, 8, 11),
+        participants=[_participant()],
+    )
+
+    _run_poll_cycle(
+        nc_calendar,
+        monkeypatch,
+        state=state,
+        calendars=[FakeCalendar([event])],
+        now=FrozenDateTime(2026, 8, 10, tzinfo=UTC),
+        identities={USER_EMAIL: USER_ID},
+        sender=sender,
+        timezone_getter=timezone_getter,
+    )
+
+    timezone_getter.assert_not_called()
+    sender.assert_not_called()
+    event.save.assert_not_called()
+
+
+def test_periodic_polling_does_not_mutate_attendee_params(
+    nc_calendar: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = InMemoryNotificationState()
     now = FrozenDateTime(
         2026,
         8,
@@ -253,15 +551,15 @@ def test_stale_cleanup_does_not_mutate_caldav(
     original_params = {
         name: list(values) for name, values in attendee.params.items()
     }
-    unrelated_event = make_poll_event(
-        event_uid="unrelated-event",
-        summary="Other event",
+    event = make_poll_event(
+        event_uid=EVENT_UID,
+        summary="Team sync",
         start=now + timedelta(minutes=30),
         end=now + timedelta(minutes=90),
-        participants=[],
+        participants=[_participant()],
         ical_attendees=attendee,
     )
-    calendar = FakeCalendar([unrelated_event])
+    calendar = FakeCalendar([event])
     mutator = Mock()
 
     _run_poll_cycle(
@@ -270,14 +568,34 @@ def test_stale_cleanup_does_not_mutate_caldav(
         state=state,
         calendars=[calendar],
         now=now,
+        identities={USER_EMAIL: USER_ID},
         mutator=mutator,
     )
 
-    assert state.deleted == [_key()]
     mutator.assert_not_called()
-    unrelated_event.save.assert_not_called()
+    event.save.assert_not_called()
     assert attendee.params == original_params
     assert calendar.expand_calls == [False]
+
+
+def test_periodic_polling_still_does_not_save_calendar_event(
+    nc_calendar: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = InMemoryNotificationState()
+    now = FrozenDateTime(2026, 8, 6, 18, tzinfo=nc_calendar.TEAM_TZ)
+    event = _weekly_event(now)
+
+    _run_poll_cycle(
+        nc_calendar,
+        monkeypatch,
+        state=state,
+        calendars=[FakeCalendar([event])],
+        now=now,
+        identities={USER_EMAIL: USER_ID},
+    )
+
+    event.save.assert_not_called()
 
 
 def test_stale_notification_is_deleted_from_local_state(
@@ -321,7 +639,7 @@ def test_observed_notification_is_not_deleted(
     )
     event = _weekly_event(now)
     sender = Mock()
-    timezone_getter = Mock(return_value=3)
+    timezone_getter = Mock(return_value=ZoneInfo("Europe/Moscow"))
 
     _run_poll_cycle(
         nc_calendar,
@@ -337,8 +655,39 @@ def test_observed_notification_is_not_deleted(
     assert state.keys == {key}
     assert state.deleted == []
     sender.assert_not_called()
-    timezone_getter.assert_not_called()
+    timezone_getter.assert_called_once_with(
+        USER_ID,
+        default_tzid=nc_calendar.TIMEZONE,
+    )
     event.save.assert_not_called()
+
+
+def test_saved_same_uid_outside_cooldown_becomes_stale(
+    nc_calendar: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    key = _key()
+    state = InMemoryNotificationState({key})
+    now = FrozenDateTime(2026, 8, 6, 18, tzinfo=UTC)
+    event = make_poll_event(
+        event_uid=EVENT_UID,
+        summary="Team sync",
+        start=now + timedelta(hours=12),
+        end=now + timedelta(hours=13),
+        participants=[_participant()],
+    )
+
+    _run_poll_cycle(
+        nc_calendar,
+        monkeypatch,
+        state=state,
+        calendars=[FakeCalendar([event])],
+        now=now,
+        identities={USER_EMAIL: USER_ID},
+    )
+
+    assert state.keys == set()
+    assert state.deleted == [key]
 
 
 def test_participant_without_telegram_id_is_skipped(
@@ -355,7 +704,7 @@ def test_participant_without_telegram_id_is_skipped(
     )
     event = _weekly_event(now, email="unknown@example.com")
     sender = Mock()
-    timezone_getter = Mock(return_value=3)
+    timezone_getter = Mock(return_value=ZoneInfo("Europe/Moscow"))
 
     _run_poll_cycle(
         nc_calendar,

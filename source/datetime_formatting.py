@@ -19,13 +19,9 @@ def format_datetime(
     return value.astimezone(target_timezone).strftime(date_format)
 
 
-def format_calendar_time(value: datetime, target_timezone: tzinfo) -> str:
-    """Format a CalDAV datetime as local hours and minutes."""
-    return format_datetime(
-        value,
-        target_timezone,
-        date_format="%H:%M",
-    )
+def format_calendar_time(value: datetime) -> str:
+    """Format an already-localized CalDAV date and time."""
+    return value.strftime("%Y-%m-%d %H:%M")
 
 
 def format_task_due_date(value: datetime, target_timezone: tzinfo) -> str:

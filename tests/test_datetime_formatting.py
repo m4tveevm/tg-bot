@@ -14,10 +14,9 @@ def test_aware_calendar_datetime_uses_effective_timezone() -> None:
 
     assert (
         format_calendar_time(
-            instant,
-            ZoneInfo("Europe/Warsaw"),
+            instant.astimezone(ZoneInfo("Europe/Warsaw")),
         )
-        == "14:00"
+        == "2026-07-15 14:00"
     )
 
 
@@ -56,10 +55,9 @@ def test_invalid_stored_timezone_does_not_raise_type_error() -> None:
 
     assert (
         format_calendar_time(
-            datetime(2026, 1, 15, 12, tzinfo=UTC),
-            resolved,
+            datetime(2026, 1, 15, 12, tzinfo=UTC).astimezone(resolved),
         )
-        == "12:00"
+        == "2026-01-15 12:00"
     )
 
 
