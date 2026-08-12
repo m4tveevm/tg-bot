@@ -3,9 +3,10 @@ import importlib
 import inspect
 import sys
 import textwrap
-from datetime import timedelta, timezone
+from datetime import timedelta
 from types import ModuleType
 from unittest.mock import Mock
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -66,7 +67,6 @@ def nc_calendar(monkeypatch: pytest.MonkeyPatch):
         CALDAV_USERNAME="caldav-user",
         CALDAV_PASSWORD="caldav-password",
         CALDAV_COOLDOWNS={"Team": [COOLDOWN]},
-        TIMEZONES={3: timezone(timedelta(hours=3))},
     )
     sender = _module(
         "source.connections.sender",
@@ -74,9 +74,12 @@ def nc_calendar(monkeypatch: pytest.MonkeyPatch):
     )
     users = _module(
         "source.db.repos.users",
+        NEXTCLOUD_FIELD_MISSING=object(),
+        get_effective_timezone=lambda _telegram_id, **_kwargs: ZoneInfo(
+            "Europe/Moscow"
+        ),
         get_tg_id_by_email=lambda _email: None,
-        save_email_by_username=_ignore,
-        get_timezone=lambda _telegram_id: 3,
+        update_nextcloud_profile=_ignore,
     )
     repository = _module(
         "source.db.repos.caldav_calendar",
@@ -98,6 +101,8 @@ def nc_calendar(monkeypatch: pytest.MonkeyPatch):
         vText=lambda value: value,
     )
 
+    requests = ModuleType("requests")
+    requests.get = _ignore
     modules = {
         "source.config": config,
         "source.connections.sender": sender,
@@ -108,7 +113,7 @@ def nc_calendar(monkeypatch: pytest.MonkeyPatch):
         "telebot.types": telebot_types,
         "caldav": caldav,
         "icalendar": icalendar,
-        "requests": ModuleType("requests"),
+        "requests": requests,
     }
     for name, module in modules.items():
         monkeypatch.setitem(sys.modules, name, module)
@@ -161,7 +166,9 @@ def _run_poll_cycle(
     principal = FakePrincipal(calendars)
     sender = sender or Mock()
     mutator = mutator or Mock()
-    timezone_getter = timezone_getter or Mock(return_value=3)
+    timezone_getter = timezone_getter or Mock(
+        return_value=ZoneInfo("Europe/Moscow")
+    )
 
     def stop_polling(_seconds: int) -> None:
         raise StopPolling
@@ -180,7 +187,11 @@ def _run_poll_cycle(
         "get_tg_id_by_email",
         (identities or {}).get,
     )
-    monkeypatch.setattr(nc_calendar, "get_timezone", timezone_getter)
+    monkeypatch.setattr(
+        nc_calendar,
+        "get_effective_timezone",
+        timezone_getter,
+    )
     monkeypatch.setattr(
         nc_calendar,
         "format_to_timezone",
